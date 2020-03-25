@@ -3,6 +3,7 @@ extern crate alsa;
 extern crate clap;
 #[cfg(feature = "FFTW")]
 extern crate fftw;
+extern crate itertools;
 #[cfg(feature = "pulse-backend")]
 extern crate libpulse_binding as pulse;
 #[cfg(feature = "pulse-backend")]

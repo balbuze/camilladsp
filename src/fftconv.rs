@@ -1,6 +1,7 @@
 use crate::filters::Filter;
 use config;
 use filters;
+use itertools::Itertools;
 use rustfft::algorithm::Radix4;
 use rustfft::num_complex::Complex;
 use rustfft::num_traits::Zero;
@@ -16,6 +17,8 @@ pub struct FFTConv {
     nsegments: usize,
     overlap: Vec<PrcFmt>,
     coeffs_f: Vec<Vec<Complex<PrcFmt>>>,
+    coeffs_k1: Vec<Vec<Complex<PrcFmt>>>,
+    coeffs_k2: Vec<Vec<Complex<PrcFmt>>>,
     fft: Box<dyn rustfft::FFT<PrcFmt>>,
     ifft: Box<dyn rustfft::FFT<PrcFmt>>,
     input_buf: Vec<Complex<PrcFmt>>,
@@ -26,29 +29,44 @@ pub struct FFTConv {
 }
 
 impl FFTConv {
+    //fn pack_complex(real_data: &[PrcFmt], complex_data)
+
     /// Create a new FFT colvolution filter.
     pub fn new(name: String, data_length: usize, coeffs: &[PrcFmt]) -> Self {
-        let input_buf: Vec<Complex<PrcFmt>> = vec![Complex::zero(); 2 * data_length];
-        let temp_buf: Vec<Complex<PrcFmt>> = vec![Complex::zero(); 2 * data_length];
-        let output_buf: Vec<Complex<PrcFmt>> = vec![Complex::zero(); 2 * data_length];
-        let fft = Radix4::new(2 * data_length, false);
-        let ifft = Radix4::new(2 * data_length, true);
+        let input_buf: Vec<Complex<PrcFmt>> = vec![Complex::zero(); data_length];
+        let temp_buf: Vec<Complex<PrcFmt>> = vec![Complex::zero(); data_length];
+        let output_buf: Vec<Complex<PrcFmt>> = vec![Complex::zero(); data_length];
+        let fft = Radix4::new(data_length, false);
+        let ifft = Radix4::new(data_length, true);
 
         let nsegments = ((coeffs.len() as PrcFmt) / (data_length as PrcFmt)).ceil() as usize;
 
-        let input_f = vec![vec![Complex::zero(); 2 * data_length]; nsegments];
-        let mut coeffs_f = vec![vec![Complex::zero(); 2 * data_length]; nsegments];
-        let mut coeffs_c = vec![vec![Complex::zero(); 2 * data_length]; nsegments];
+        let input_f = vec![vec![Complex::zero(); data_length]; nsegments];
+        let mut coeffs_f = vec![vec![Complex::zero(); data_length]; nsegments];
+        let mut coeffs_k1 = vec![vec![Complex::zero(); data_length]; nsegments];
+        let mut coeffs_k2 = vec![vec![Complex::zero(); data_length]; nsegments];
+        let mut coeffs_c = vec![vec![Complex::zero(); data_length]; nsegments];
 
         debug!("Conv {} is using {} segments", name, nsegments);
-
-        for (n, coeff) in coeffs.iter().enumerate() {
+        let mut n = 0;
+        for pair in (coeffs.iter().chunks(2)).into_iter().map(|mut chunk| Complex::new(*chunk.next().unwrap(), *chunk.next().unwrap())){
             coeffs_c[n / data_length][n % data_length] =
-                Complex::from(coeff / (2.0 * data_length as PrcFmt));
+                pair / Complex::from(2.0 * data_length as PrcFmt);
+            n+=1;
+            println!("{}, {}", n, pair);
         }
-
+        println!("done");
+        let mut m = 0;
         for (segment, segment_f) in coeffs_c.iter_mut().zip(coeffs_f.iter_mut()) {
             fft.process(segment, segment_f);
+            for n in 0..data_length {
+                println!("n {}", n);
+                let nfracpi = (std::f64::consts::PI as PrcFmt)*(n as PrcFmt)/(data_length as PrcFmt);
+                coeffs_k1[m][n] = (segment_f[n] - segment_f[data_length - n - 1].conj()).scale(0.5*(nfracpi.cos()));
+                coeffs_k2[m][n] = (segment_f[n].scale(1.0-nfracpi.sin()) + segment_f[data_length - n - 1].conj().scale(1.0+nfracpi.sin())).scale(0.5);
+            }
+            m+=1;
+            println!("m {}", m);
         }
 
         FFTConv {
@@ -57,6 +75,8 @@ impl FFTConv {
             nsegments,
             overlap: vec![0.0; data_length],
             coeffs_f,
+            coeffs_k1,
+            coeffs_k2,
             fft: Box::new(fft),
             ifft: Box::new(ifft),
             input_f,
@@ -86,37 +106,57 @@ impl Filter for FFTConv {
     /// Process a waveform by FT, then multiply transform with transform of filter, and then transform back.
     fn process_waveform(&mut self, waveform: &mut Vec<PrcFmt>) -> Res<()> {
         // Copy to inut buffer and convert to complex
-        for (n, item) in waveform.iter_mut().enumerate().take(self.npoints) {
-            self.input_buf[n] = Complex::<PrcFmt>::from(*item);
-            //self.input_buf[n+self.npoints] = Complex::zero();
+        //for (n, item) in waveform.iter_mut().enumerate().take(self.npoints) {
+        //    self.input_buf[n] = Complex::<PrcFmt>::from(*item);
+        //    //self.input_buf[n+self.npoints] = Complex::zero();
+        //}
+        let mut n = 0;
+        for pair in (waveform.iter().chunks(2)).into_iter().map(|mut chunk| Complex::new(*chunk.next().unwrap(), *chunk.next().unwrap())){
+            self.input_buf[n] = pair;
+            n+=1;
+            println!("{}, {}", n, pair);
         }
 
         // FFT and store result in history, update index
         self.index = (self.index + 1) % self.nsegments;
         self.fft
             .process(&mut self.input_buf, &mut self.input_f[self.index]);
-
+        print!("a");
         //self.temp_buf = vec![Complex::zero(); 2 * self.npoints];
         // Loop through history of input FTs, multiply with filter FTs, accumulate result
         let segm = 0;
         let hist_idx = (self.index + self.nsegments - segm) % self.nsegments;
-        for n in 0..2 * self.npoints {
-            self.temp_buf[n] = self.input_f[hist_idx][n] * self.coeffs_f[segm][n];
+        for n in 0..self.npoints/2 {
+            println!("s 0: {}", n);
+            self.temp_buf[n] = -self.input_f[hist_idx][n] * self.coeffs_k1[segm][n]*Complex::i()
+                      + self.input_f[hist_idx][self.npoints - n -1].conj() * self.coeffs_k2[segm][n];
         }
         for segm in 1..self.nsegments {
             let hist_idx = (self.index + self.nsegments - segm) % self.nsegments;
-            for n in 0..2 * self.npoints {
-                self.temp_buf[n] += self.input_f[hist_idx][n] * self.coeffs_f[segm][n];
+            for n in 0..self.npoints/2 {
+                println!("s {}: {}", segm, n);
+                self.temp_buf[n] += -self.input_f[hist_idx][n] * self.coeffs_k1[segm][n]*Complex::i()
+                          + self.input_f[hist_idx][self.npoints - n -1].conj() * self.coeffs_k2[segm][n];
             }
         }
 
         // IFFT result, store result anv overlap
         self.ifft.process(&mut self.temp_buf, &mut self.output_buf);
         //let mut filtered: Vec<PrcFmt> = vec![0.0; self.npoints];
-        for (n, item) in waveform.iter_mut().enumerate().take(self.npoints) {
-            *item = self.output_buf[n].re + self.overlap[n];
-            self.overlap[n] = self.output_buf[n + self.npoints].re;
+
+        for n in 0..(self.npoints/2) {
+            println!("out {}", n);
+            waveform[2*n] = self.output_buf[n].re + self.overlap[2*n];
+            waveform[2*n+1] = self.output_buf[n].im + self.overlap[2*n+1];
+            self.overlap[2*n] = self.output_buf[2*n + self.npoints/2].re;
+            self.overlap[2*n+1] = self.output_buf[2*n +1 + self.npoints/2].im;
         }
+
+
+        //for (n, item) in waveform.iter_mut().enumerate().take(self.npoints) {
+        //    *item = self.output_buf[n].re + self.overlap[n];
+        //    self.overlap[n] = self.output_buf[n + self.npoints].re;
+        //}
         Ok(())
     }
 
