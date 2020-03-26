@@ -38,32 +38,46 @@ impl FFTConv {
         let output_buf: Vec<Complex<PrcFmt>> = vec![Complex::zero(); data_length];
         let fft = Radix4::new(data_length, false);
         let ifft = Radix4::new(data_length, true);
+        
+        let fft_temp = Radix4::new(2*data_length, false);
+
 
         let nsegments = ((coeffs.len() as PrcFmt) / (data_length as PrcFmt)).ceil() as usize;
-
+        println!("segments: {}", nsegments);
         let input_f = vec![vec![Complex::zero(); data_length]; nsegments];
-        let mut coeffs_f = vec![vec![Complex::zero(); data_length]; nsegments];
+        let mut coeffs_f = vec![vec![Complex::zero(); 2*data_length]; nsegments];
         let mut coeffs_k1 = vec![vec![Complex::zero(); data_length]; nsegments];
         let mut coeffs_k2 = vec![vec![Complex::zero(); data_length]; nsegments];
-        let mut coeffs_c = vec![vec![Complex::zero(); data_length]; nsegments];
+        let mut coeffs_c = vec![vec![Complex::zero(); 2*data_length]; nsegments];
 
         debug!("Conv {} is using {} segments", name, nsegments);
-        let mut n = 0;
-        for pair in (coeffs.iter().chunks(2)).into_iter().map(|mut chunk| Complex::new(*chunk.next().unwrap_or(&0.0), *chunk.next().unwrap_or(&0.0))){
+        //let mut n = 0;
+        //for pair in (coeffs.iter().chunks(2)).into_iter().map(|mut chunk| Complex::new(*chunk.next().unwrap_or(&0.0), *chunk.next().unwrap_or(&0.0))){
+        //    coeffs_c[n / data_length][n % data_length] =
+        //        pair.unscale((data_length) as PrcFmt);
+        //        coeffs_segm[]
+        //    n+=1;
+        //    //println!("{}, {}", n, pair);
+        //}
+        for (n, coeff) in coeffs.iter().enumerate() {
             coeffs_c[n / data_length][n % data_length] =
-                pair.unscale((data_length) as PrcFmt);
-            n+=1;
-            //println!("{}, {}", n, pair);
+                Complex::from(coeff / (data_length as PrcFmt));
         }
-        //println!("done");
+
+        //for (segment, segment_f) in coeffs_c.iter_mut().zip(coeffs_f.iter_mut()) {
+        //    fft.process(segment, segment_f);
+        //}
+        println!("coeffs_c: {:?}", coeffs_c);
         let mut m = 0;
         for (segment, segment_f) in coeffs_c.iter_mut().zip(coeffs_f.iter_mut()) {
-            fft.process(segment, segment_f);
+            fft_temp.process(segment, segment_f);
             for n in 0..data_length {
                 //println!("n {}", n);
                 let nfracpi = (std::f64::consts::PI as PrcFmt)*(n as PrcFmt)/(data_length as PrcFmt);
-                coeffs_k1[m][n] = (segment_f[n] - segment_f[(data_length - n)%data_length].conj()).scale(0.5*(nfracpi.cos()));
-                coeffs_k2[m][n] = (segment_f[n].scale(1.0-nfracpi.sin()) + segment_f[(data_length - n)%data_length].conj().scale(1.0+nfracpi.sin())).scale(0.5);
+                coeffs_k1[m][n] = (segment_f[n] - segment_f[(data_length - n)].conj()).scale(0.5*(nfracpi.cos()));
+                coeffs_k2[m][n] = (segment_f[n].scale(1.0-nfracpi.sin()) + segment_f[(data_length - n)].conj().scale(1.0+nfracpi.sin())).scale(0.5);
+                //coeffs_k1[m][n] = (segment_f[n] - segment_f[(data_length - n)%data_length].conj()).scale(0.5*(nfracpi.cos()));
+                //coeffs_k2[m][n] = (segment_f[n].scale(1.0-nfracpi.sin()) + segment_f[(data_length - n)%data_length].conj().scale(1.0+nfracpi.sin())).scale(0.5);
             }
             println!("k1[{}]: {:?}", m, coeffs_k1[m]);
             println!("k2[{}]: {:?}", m, coeffs_k2[m]);
@@ -115,7 +129,7 @@ impl Filter for FFTConv {
         for pair in (waveform.iter().chunks(2)).into_iter().map(|mut chunk| Complex::new(*chunk.next().unwrap_or(&0.0), *chunk.next().unwrap_or(&0.0))){
             self.input_buf[n] = pair;
             n+=1;
-            //println!("{}, {}", n, pair);
+            println!("packing.. {}, {}", n, pair);
         }
         println!("input: {:?}", self.input_buf);
 
@@ -123,6 +137,7 @@ impl Filter for FFTConv {
         self.index = (self.index + 1) % self.nsegments;
         self.fft
             .process(&mut self.input_buf, &mut self.input_f[self.index]);
+        println!("input fft: {:?}", self.input_f);
         //print!("a");
         //self.temp_buf = vec![Complex::zero(); 2 * self.npoints];
         // Loop through history of input FTs, multiply with filter FTs, accumulate result
@@ -141,24 +156,25 @@ impl Filter for FFTConv {
                           + self.input_f[hist_idx][(self.npoints - n)%self.npoints].conj() * self.coeffs_k2[segm][n];
             }
         }
-
+        println!("multiplied: {:?}", self.temp_buf);
+        //self.temp_buf = vec![Complex::new(0.0, -0.25); 4];
         // IFFT result, store result anv overlap
         self.ifft.process(&mut self.temp_buf, &mut self.output_buf);
         //let mut filtered: Vec<PrcFmt> = vec![0.0; self.npoints];
 
-        //println!("output: {:?}", self.output_buf);
+        println!("output: {:?}", self.output_buf);
         for n in 0..(self.npoints/2) {
-            //println!("out {}", n);
+            println!("out {}", n);
             waveform[2*n] = self.output_buf[n].re + self.overlap[2*n];
-            //println!("a");
-            waveform[2*n+1] = self.output_buf[n].im + self.overlap[2*n+1];
-            //println!("b");
-            self.overlap[2*n] = self.output_buf[2 + self.npoints/2].re;
-            //println!("c: {}, {}", 2*n+1, 2*n + self.npoints/2);
-            self.overlap[2*n+1] = self.output_buf[n + self.npoints/2].im;
+            println!("a");
+            waveform[2*n+1] = -self.output_buf[n].im + self.overlap[2*n+1];
+            println!("b");
+            self.overlap[2*n] = self.output_buf[n + self.npoints/2].re;
+            println!("c: {}, {}", 2*n+1, 2*n + self.npoints/2);
+            self.overlap[2*n+1] = -self.output_buf[n + self.npoints/2].im;
         }
         println!("output wf: {:?}", waveform);
-
+        println!("overlap: {:?}", self.overlap);
 
         //for (n, item) in waveform.iter_mut().enumerate().take(self.npoints) {
         //    *item = self.output_buf[n].re + self.overlap[n];
@@ -246,12 +262,39 @@ mod tests {
     }
 
     #[test]
-    fn check_dumb() {
+    fn check_simplest() {
         let coeffs = vec![1.0];
+        let conf = ConvParameters::Values { values: coeffs };
+        let mut filter = FFTConv::from_config("test".to_string(), 4, conf);
+        let mut wave1 = vec![1.0, 0.0, 0.0, 1.0];
+        let expected = vec![1.0, 0.0, 0.0, 1.0];
+        filter.process_waveform(&mut wave1).unwrap();
+        assert!(compare_waveforms(wave1, expected, 1e-7));
+    }
+
+    //1 1,0; 1,0; 1,0; 1,0
+    //2 0,1; 0,1; 0,1; 0,1;
+    //3 1,0; 0,-1; -1,0; 0,1
+    //4 0,1; 1,0; 0,-1; -1,0
+
+    #[test]
+    fn check_realonly() {
+        let coeffs = vec![1.0, 0.0, 1.0];
+        let conf = ConvParameters::Values { values: coeffs };
+        let mut filter = FFTConv::from_config("test".to_string(), 8, conf);
+        let mut wave1 = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let expected = vec![1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0];
+        filter.process_waveform(&mut wave1).unwrap();
+        assert!(compare_waveforms(wave1, expected, 1e-7));
+    }
+
+    #[test]
+    fn check_imagonly() {
+        let coeffs = vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let conf = ConvParameters::Values { values: coeffs };
         let mut filter = FFTConv::from_config("test".to_string(), 8, conf);
         let mut wave1 = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let expected = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let expected = vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         filter.process_waveform(&mut wave1).unwrap();
         assert!(compare_waveforms(wave1, expected, 1e-7));
     }
